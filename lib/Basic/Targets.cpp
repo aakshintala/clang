@@ -2247,6 +2247,108 @@ bool AMDGPUTargetInfo::initFeatureMap(
   return TargetInfo::initFeatureMap(Features, Diags, CPU, FeatureVec);
 }
 
+static const unsigned TGSIAddrSpaceMap[] = {
+    1, // opencl_global
+    3, // opencl_local
+    4, // opencl_constant
+    // FIXME: generic has to be added to the target
+    0, // opencl_generic
+    1, // cuda_device
+    4, // cuda_constant
+    3, // cuda_shared
+};
+
+class TGSITargetInfo : public TargetInfo {
+  static const char *const GCCRegNames[];
+#if 0
+  static const Builtin::Info BuiltinInfo[];
+#endif
+
+public:
+  TGSITargetInfo(const llvm::Triple &Triple) : TargetInfo(Triple) {
+    BigEndian = false;
+    TLSSupported = false;
+    LongWidth = LongAlign = 64;
+    AddrSpaceMap = &TGSIAddrSpaceMap;
+    UseAddrSpaceMapMangling = true;
+    // Define available target features
+    // These must be defined in sorted order!
+    NoAsmVariants = true;
+  }
+  void getTargetDefines(const LangOptions &Opts,
+                        MacroBuilder &Builder) const override {
+    Builder.defineMacro("__TGSI__");
+  }
+  ArrayRef<Builtin::Info> getTargetBuiltins() const override {
+#if 1
+    // FIXME: Implement!
+    return None;
+#else
+    return llvm::makeArrayRef(BuiltinInfo,
+                         clang::TGSI::LastTSBuiltin - Builtin::FirstTSBuiltin);
+#endif
+  }
+
+  ArrayRef<const char *> getGCCRegNames() const override;
+  ArrayRef<TargetInfo::GCCRegAlias> getGCCRegAliases() const override {
+    // No aliases.
+    return None;
+  }
+  bool validateAsmConstraint(const char *&Name,
+                             TargetInfo::ConstraintInfo &Info) const override {
+    return false;
+  }
+  const char *getClobbers() const override {
+    return "";
+  }
+  BuiltinVaListKind getBuiltinVaListKind() const override {
+    return TargetInfo::CharPtrBuiltinVaList;
+  }
+  void setSupportedOpenCLOpts() override {
+    auto &Opts = getSupportedOpenCLOpts();
+    Opts.cl_clang_storage_class_specifiers = 1;
+#if 0
+    Opts.cl_khr_gl_sharing = 1;
+    Opts.cl_khr_icd = 1;
+
+    Opts.cl_khr_fp64 = 1;
+    Opts.cl_khr_byte_addressable_store = 1;
+    Opts.cl_khr_global_int32_base_atomics = 1;
+    Opts.cl_khr_global_int32_extended_atomics = 1;
+    Opts.cl_khr_local_int32_base_atomics = 1;
+    Opts.cl_khr_local_int32_extended_atomics = 1;
+#endif
+  }
+};
+
+#if 0
+const Builtin::Info TGSITargetInfo::BuiltinInfo[] = {
+#define BUILTIN(ID, TYPE, ATTRS)                                               \
+  { #ID, TYPE, ATTRS, nullptr, ALL_LANGUAGES, nullptr },
+#define LIBBUILTIN(ID, TYPE, ATTRS, HEADER)                                    \
+  { #ID, TYPE, ATTRS, HEADER, ALL_LANGUAGES, nullptr },
+//#include "clang/Basic/BuiltinsTGSI.def"
+};
+#endif
+
+const char *const TGSITargetInfo::GCCRegNames[] = {"r0"};
+
+ArrayRef<const char *> TGSITargetInfo::getGCCRegNames() const {
+  return llvm::makeArrayRef(GCCRegNames);
+}
+
+class TGSI32TargetInfo : public TGSITargetInfo {
+public:
+  TGSI32TargetInfo(const llvm::Triple &Triple) : TGSITargetInfo(Triple) {
+    LongWidth = LongAlign = 32;
+    PointerWidth = PointerAlign = 32;
+    SizeType = TargetInfo::UnsignedInt;
+    PtrDiffType = TargetInfo::SignedInt;
+    IntPtrType = TargetInfo::SignedInt;
+    resetDataLayout("E-p:32:32-i64:64:64-f32:32:32-n32");
+  }
+};
+
 // Namespace for x86 abstract base class
 const Builtin::Info BuiltinInfo[] = {
 #define BUILTIN(ID, TYPE, ATTRS)                                               \
@@ -8296,6 +8398,9 @@ static TargetInfo *AllocateTarget(const llvm::Triple &Triple,
   case llvm::Triple::amdgcn:
   case llvm::Triple::r600:
     return new AMDGPUTargetInfo(Triple, Opts);
+
+  case llvm::Triple::tgsi:
+    return new TGSI32TargetInfo(Triple);
 
   case llvm::Triple::sparc:
     switch (os) {
