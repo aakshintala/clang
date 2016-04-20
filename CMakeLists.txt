@@ -391,9 +391,7 @@ macro(add_clang_library name)
       ${ARG_ADDITIONAL_HEADERS} # It may contain unparsed unknown args.
       )
   endif()
-  if(ARG_SHARED)
-    set(ARG_ENABLE_SHARED SHARED)
-  endif()
+  set(ARG_ENABLE_SHARED SHARED)
   llvm_add_library(${name} ${ARG_ENABLE_SHARED} ${ARG_UNPARSED_ARGUMENTS} ${srcs})
 
   if(TARGET ${name})
