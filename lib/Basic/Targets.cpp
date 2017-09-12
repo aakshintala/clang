@@ -2442,7 +2442,7 @@ public:
   }
   void setSupportedOpenCLOpts() override {
     auto &Opts = getSupportedOpenCLOpts();
-    Opts.cl_clang_storage_class_specifiers = 1;
+    Opts.support("cl_clang_storage_class_specifiers");
 #if 0
     Opts.cl_khr_gl_sharing = 1;
     Opts.cl_khr_icd = 1;
