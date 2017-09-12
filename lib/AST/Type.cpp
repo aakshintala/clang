@@ -11,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/AST/Type.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/CharUnits.h"
@@ -19,13 +20,11 @@
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/PrettyPrinter.h"
-#include "clang/AST/Type.h"
 #include "clang/AST/TypeVisitor.h"
 #include "clang/Basic/Specifiers.h"
 #include "clang/Basic/TargetInfo.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/StringExtras.h"
-#include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 using namespace clang;
 
@@ -532,6 +531,18 @@ bool Type::isObjCInertUnsafeUnretainedType() const {
   }
 }
 
+ObjCTypeParamType::ObjCTypeParamType(const ObjCTypeParamDecl *D,
+                                     QualType can,
+                                     ArrayRef<ObjCProtocolDecl *> protocols)
+  : Type(ObjCTypeParam, can, can->isDependentType(),
+         can->isInstantiationDependentType(),
+         can->isVariablyModifiedType(),
+         /*ContainsUnexpandedParameterPack=*/false),
+    OTPDecl(const_cast<ObjCTypeParamDecl*>(D))
+{
+  initialize(protocols);
+}
+
 ObjCObjectType::ObjCObjectType(QualType Canonical, QualType Base,
                                ArrayRef<QualType> typeArgs,
                                ArrayRef<ObjCProtocolDecl *> protocols,
@@ -547,15 +558,9 @@ ObjCObjectType::ObjCObjectType(QualType Canonical, QualType Base,
   ObjCObjectTypeBits.NumTypeArgs = typeArgs.size();
   assert(getTypeArgsAsWritten().size() == typeArgs.size() &&
          "bitfield overflow in type argument count");
-  ObjCObjectTypeBits.NumProtocols = protocols.size();
-  assert(getNumProtocols() == protocols.size() &&
-         "bitfield overflow in protocol count");
   if (!typeArgs.empty())
     memcpy(getTypeArgStorage(), typeArgs.data(),
            typeArgs.size() * sizeof(QualType));
-  if (!protocols.empty())
-    memcpy(getProtocolStorage(), protocols.data(),
-           protocols.size() * sizeof(ObjCProtocolDecl*));
 
   for (auto typeArg : typeArgs) {
     if (typeArg->isDependentType())
@@ -566,6 +571,9 @@ ObjCObjectType::ObjCObjectType(QualType Canonical, QualType Base,
     if (typeArg->containsUnexpandedParameterPack())
       setContainsUnexpandedParameterPack();
   }
+  // Initialize the protocol qualifiers. The protocol storage is known
+  // after we set number of type arguments.
+  initialize(protocols);
 }
 
 bool ObjCObjectType::isSpecialized() const { 
@@ -883,6 +891,7 @@ public:
   }
 
   TRIVIAL_TYPE_CLASS(Typedef)
+  TRIVIAL_TYPE_CLASS(ObjCTypeParam)
 
   QualType VisitAdjustedType(const AdjustedType *T) { 
     QualType originalType = recurse(T->getOriginalType());
@@ -1048,7 +1057,7 @@ QualType simpleTransform(ASTContext &ctx, QualType type, F &&f) {
   SplitQualType splitType = type.split();
 
   // Visit the type itself.
-  SimpleTransformVisitor<F> visitor(ctx, std::move(f));
+  SimpleTransformVisitor<F> visitor(ctx, std::forward<F>(f));
   QualType result = visitor.Visit(splitType.Ty);
   if (result.isNull())
     return result;
@@ -1072,13 +1081,24 @@ QualType QualType::substObjCTypeArgs(
 
     // Replace an Objective-C type parameter reference with the corresponding
     // type argument.
-    if (const auto *typedefTy = dyn_cast<TypedefType>(splitType.Ty)) {
-      if (auto *typeParam = dyn_cast<ObjCTypeParamDecl>(typedefTy->getDecl())) {
+    if (const auto *OTPTy = dyn_cast<ObjCTypeParamType>(splitType.Ty)) {
+      if (auto *typeParam = dyn_cast<ObjCTypeParamDecl>(OTPTy->getDecl())) {
         // If we have type arguments, use them.
         if (!typeArgs.empty()) {
-          // FIXME: Introduce SubstObjCTypeParamType ?
           QualType argType = typeArgs[typeParam->getIndex()];
-          return ctx.getQualifiedType(argType, splitType.Quals);
+          if (OTPTy->qual_empty())
+            return ctx.getQualifiedType(argType, splitType.Quals);
+
+          // Apply protocol lists if exists.
+          bool hasError;
+          SmallVector<ObjCProtocolDecl*, 8> protocolsVec;
+          protocolsVec.append(OTPTy->qual_begin(),
+                              OTPTy->qual_end());
+          ArrayRef<ObjCProtocolDecl *> protocolsToApply = protocolsVec;
+          QualType resultTy = ctx.applyObjCProtocolQualifiers(argType,
+              protocolsToApply, hasError, true/*allowOnPointerType*/);
+
+          return ctx.getQualifiedType(resultTy, splitType.Quals);
         }
 
         switch (context) {
@@ -2317,6 +2337,15 @@ bool QualType::isCXX11PODType(const ASTContext &Context) const {
   return false;
 }
 
+bool Type::isAlignValT() const {
+  if (auto *ET = getAs<EnumType>()) {
+    auto *II = ET->getDecl()->getIdentifier();
+    if (II && II->isStr("align_val_t") && ET->getDecl()->isInStdNamespace())
+      return true;
+  }
+  return false;
+}
+
 bool Type::isPromotableIntegerType() const {
   if (const BuiltinType *BT = getAs<BuiltinType>())
     switch (BT->getKind()) {
@@ -2460,19 +2489,20 @@ StringRef TypeWithKeyword::getKeywordName(ElaboratedTypeKeyword Keyword) {
 DependentTemplateSpecializationType::DependentTemplateSpecializationType(
                          ElaboratedTypeKeyword Keyword,
                          NestedNameSpecifier *NNS, const IdentifierInfo *Name,
-                         unsigned NumArgs, const TemplateArgument *Args,
+                         ArrayRef<TemplateArgument> Args,
                          QualType Canon)
   : TypeWithKeyword(Keyword, DependentTemplateSpecialization, Canon, true, true,
                     /*VariablyModified=*/false,
                     NNS && NNS->containsUnexpandedParameterPack()),
-    NNS(NNS), Name(Name), NumArgs(NumArgs) {
+    NNS(NNS), Name(Name), NumArgs(Args.size()) {
   assert((!NNS || NNS->isDependent()) &&
          "DependentTemplateSpecializatonType requires dependent qualifier");
-  for (unsigned I = 0; I != NumArgs; ++I) {
-    if (Args[I].containsUnexpandedParameterPack())
+  TemplateArgument *ArgBuffer = getArgBuffer();
+  for (const TemplateArgument &Arg : Args) {
+    if (Arg.containsUnexpandedParameterPack())
       setContainsUnexpandedParameterPack();
 
-    new (&getArgBuffer()[I]) TemplateArgument(Args[I]);
+    new (ArgBuffer++) TemplateArgument(Arg);
   }
 }
 
@@ -2482,13 +2512,12 @@ DependentTemplateSpecializationType::Profile(llvm::FoldingSetNodeID &ID,
                                              ElaboratedTypeKeyword Keyword,
                                              NestedNameSpecifier *Qualifier,
                                              const IdentifierInfo *Name,
-                                             unsigned NumArgs,
-                                             const TemplateArgument *Args) {
+                                             ArrayRef<TemplateArgument> Args) {
   ID.AddInteger(Keyword);
   ID.AddPointer(Qualifier);
   ID.AddPointer(Name);
-  for (unsigned Idx = 0; Idx < NumArgs; ++Idx)
-    Args[Idx].Profile(ID, Context);
+  for (const TemplateArgument &Arg : Args)
+    Arg.Profile(ID, Context);
 }
 
 bool Type::isElaboratedTypeSpecifier() const {
@@ -2638,11 +2667,12 @@ StringRef FunctionType::getNameForCallConv(CallingConv CC) {
   case CC_X86VectorCall: return "vectorcall";
   case CC_X86_64Win64: return "ms_abi";
   case CC_X86_64SysV: return "sysv_abi";
+  case CC_X86RegCall : return "regcall";
   case CC_AAPCS: return "aapcs";
   case CC_AAPCS_VFP: return "aapcs-vfp";
   case CC_IntelOclBicc: return "intel_ocl_bicc";
   case CC_SpirFunction: return "spir_function";
-  case CC_SpirKernel: return "spir_kernel";
+  case CC_OpenCLKernel: return "opencl_kernel";
   case CC_Swift: return "swiftcall";
   case CC_PreserveMost: return "preserve_most";
   case CC_PreserveAll: return "preserve_all";
@@ -2688,8 +2718,9 @@ FunctionProtoType::FunctionProtoType(QualType result, ArrayRef<QualType> params,
     QualType *exnSlot = argSlot + NumParams;
     unsigned I = 0;
     for (QualType ExceptionType : epi.ExceptionSpec.Exceptions) {
-      // Note that a dependent exception specification does *not* make
-      // a type dependent; it's not even part of the C++ type system.
+      // Note that, before C++17, a dependent exception specification does
+      // *not* make a type dependent; it's not even part of the C++ type
+      // system.
       if (ExceptionType->isInstantiationDependentType())
         setInstantiationDependent();
 
@@ -2728,6 +2759,19 @@ FunctionProtoType::FunctionProtoType(QualType result, ArrayRef<QualType> params,
     slot[0] = epi.ExceptionSpec.SourceDecl;
   }
 
+  // If this is a canonical type, and its exception specification is dependent,
+  // then it's a dependent type. This only happens in C++17 onwards.
+  if (isCanonicalUnqualified()) {
+    if (getExceptionSpecType() == EST_Dynamic ||
+        getExceptionSpecType() == EST_ComputedNoexcept) {
+      assert(hasDependentExceptionSpec() && "type should not be canonical");
+      setDependent();
+    }
+  } else if (getCanonicalTypeInternal()->isDependentType()) {
+    // Ask our canonical type whether our exception specification was dependent.
+    setDependent();
+  }
+
   if (epi.ExtParameterInfos) {
     ExtParameterInfo *extParamInfos =
       const_cast<ExtParameterInfo *>(getExtParameterInfosBuffer());
@@ -2744,6 +2788,15 @@ bool FunctionProtoType::hasDependentExceptionSpec() const {
     // because we don't know whether the pattern is in the exception spec
     // or not (that depends on whether the pack has 0 expansions).
     if (ET->isDependentType() || ET->getAs<PackExpansionType>())
+      return true;
+  return false;
+}
+
+bool FunctionProtoType::hasInstantiationDependentExceptionSpec() const {
+  if (Expr *NE = getNoexceptExpr())
+    return NE->isInstantiationDependent();
+  for (QualType ET : exceptions())
+    if (ET->isInstantiationDependentType())
       return true;
   return false;
 }
@@ -2772,29 +2825,28 @@ FunctionProtoType::getNoexceptSpec(const ASTContext &ctx) const {
   return value.getBoolValue() ? NR_Nothrow : NR_Throw;
 }
 
-bool FunctionProtoType::isNothrow(const ASTContext &Ctx,
-                                  bool ResultIfDependent) const {
+CanThrowResult FunctionProtoType::canThrow(const ASTContext &Ctx) const {
   ExceptionSpecificationType EST = getExceptionSpecType();
   assert(EST != EST_Unevaluated && EST != EST_Uninstantiated);
   if (EST == EST_DynamicNone || EST == EST_BasicNoexcept)
-    return true;
+    return CT_Cannot;
 
-  if (EST == EST_Dynamic && ResultIfDependent) {
+  if (EST == EST_Dynamic) {
     // A dynamic exception specification is throwing unless every exception
     // type is an (unexpanded) pack expansion type.
     for (unsigned I = 0, N = NumExceptions; I != N; ++I)
       if (!getExceptionType(I)->getAs<PackExpansionType>())
-        return false;
-    return ResultIfDependent;
+        return CT_Can;
+    return CT_Dependent;
   }
 
   if (EST != EST_ComputedNoexcept)
-    return false;
+    return CT_Can;
 
   NoexceptResult NR = getNoexceptSpec(Ctx);
   if (NR == NR_Dependent)
-    return ResultIfDependent;
-  return NR == NR_Nothrow;
+    return CT_Dependent;
+  return NR == NR_Nothrow ? CT_Cannot : CT_Can;
 }
 
 bool FunctionProtoType::isTemplateVariadic() const {
@@ -2808,7 +2860,7 @@ bool FunctionProtoType::isTemplateVariadic() const {
 void FunctionProtoType::Profile(llvm::FoldingSetNodeID &ID, QualType Result,
                                 const QualType *ArgTys, unsigned NumParams,
                                 const ExtProtoInfo &epi,
-                                const ASTContext &Context) {
+                                const ASTContext &Context, bool Canonical) {
 
   // We have to be careful not to get ambiguous profile encodings.
   // Note that valid type pointers are never ambiguous with anything else.
@@ -2847,7 +2899,7 @@ void FunctionProtoType::Profile(llvm::FoldingSetNodeID &ID, QualType Result,
       ID.AddPointer(Ex.getAsOpaquePtr());
   } else if (epi.ExceptionSpec.Type == EST_ComputedNoexcept &&
              epi.ExceptionSpec.NoexceptExpr) {
-    epi.ExceptionSpec.NoexceptExpr->Profile(ID, Context, false);
+    epi.ExceptionSpec.NoexceptExpr->Profile(ID, Context, Canonical);
   } else if (epi.ExceptionSpec.Type == EST_Uninstantiated ||
              epi.ExceptionSpec.Type == EST_Unevaluated) {
     ID.AddPointer(epi.ExceptionSpec.SourceDecl->getCanonicalDecl());
@@ -2863,7 +2915,7 @@ void FunctionProtoType::Profile(llvm::FoldingSetNodeID &ID, QualType Result,
 void FunctionProtoType::Profile(llvm::FoldingSetNodeID &ID,
                                 const ASTContext &Ctx) {
   Profile(ID, getReturnType(), param_type_begin(), NumParams, getExtProtoInfo(),
-          Ctx);
+          Ctx, isCanonicalUnqualified());
 }
 
 QualType TypedefType::desugar() const {
@@ -2992,6 +3044,7 @@ bool AttributedType::isQualifier() const {
   case AttributedType::attr_fastcall:
   case AttributedType::attr_stdcall:
   case AttributedType::attr_thiscall:
+  case AttributedType::attr_regcall:
   case AttributedType::attr_pascal:
   case AttributedType::attr_swiftcall:
   case AttributedType::attr_vectorcall:
@@ -3049,6 +3102,7 @@ bool AttributedType::isCallingConv() const {
   case attr_fastcall:
   case attr_stdcall:
   case attr_thiscall:
+  case attr_regcall:
   case attr_swiftcall:
   case attr_vectorcall:
   case attr_pascal:
@@ -3100,20 +3154,20 @@ void SubstTemplateTypeParmPackType::Profile(llvm::FoldingSetNodeID &ID,
 bool TemplateSpecializationType::
 anyDependentTemplateArguments(const TemplateArgumentListInfo &Args,
                               bool &InstantiationDependent) {
-  return anyDependentTemplateArguments(Args.getArgumentArray(), Args.size(),
+  return anyDependentTemplateArguments(Args.arguments(),
                                        InstantiationDependent);
 }
 
 bool TemplateSpecializationType::
-anyDependentTemplateArguments(const TemplateArgumentLoc *Args, unsigned N,
+anyDependentTemplateArguments(ArrayRef<TemplateArgumentLoc> Args,
                               bool &InstantiationDependent) {
-  for (unsigned i = 0; i != N; ++i) {
-    if (Args[i].getArgument().isDependent()) {
+  for (const TemplateArgumentLoc &ArgLoc : Args) {
+    if (ArgLoc.getArgument().isDependent()) {
       InstantiationDependent = true;
       return true;
     }
-    
-    if (Args[i].getArgument().isInstantiationDependent())
+
+    if (ArgLoc.getArgument().isInstantiationDependent())
       InstantiationDependent = true;
   }
   return false;
@@ -3121,7 +3175,7 @@ anyDependentTemplateArguments(const TemplateArgumentLoc *Args, unsigned N,
 
 TemplateSpecializationType::
 TemplateSpecializationType(TemplateName T,
-                           const TemplateArgument *Args, unsigned NumArgs,
+                           ArrayRef<TemplateArgument> Args,
                            QualType Canon, QualType AliasedType)
   : Type(TemplateSpecialization,
          Canon.isNull()? QualType(this, 0) : Canon,
@@ -3129,7 +3183,7 @@ TemplateSpecializationType(TemplateName T,
          Canon.isNull()? true : Canon->isInstantiationDependentType(),
          false,
          T.containsUnexpandedParameterPack()),
-    Template(T), NumArgs(NumArgs), TypeAlias(!AliasedType.isNull()) {
+    Template(T), NumArgs(Args.size()), TypeAlias(!AliasedType.isNull()) {
   assert(!T.getAsDependentTemplateName() && 
          "Use DependentTemplateSpecializationType for dependent template-name");
   assert((T.getKind() == TemplateName::Template ||
@@ -3139,7 +3193,7 @@ TemplateSpecializationType(TemplateName T,
 
   TemplateArgument *TemplateArgs
     = reinterpret_cast<TemplateArgument *>(this + 1);
-  for (unsigned Arg = 0; Arg < NumArgs; ++Arg) {
+  for (const TemplateArgument &Arg : Args) {
     // Update instantiation-dependent and variably-modified bits.
     // If the canonical type exists and is non-dependent, the template
     // specialization type can be non-dependent even if one of the type
@@ -3148,14 +3202,14 @@ TemplateSpecializationType(TemplateName T,
     // U<T> is always non-dependent, irrespective of the type T.
     // However, U<Ts> contains an unexpanded parameter pack, even though
     // its expansion (and thus its desugared type) doesn't.
-    if (Args[Arg].isInstantiationDependent())
+    if (Arg.isInstantiationDependent())
       setInstantiationDependent();
-    if (Args[Arg].getKind() == TemplateArgument::Type &&
-        Args[Arg].getAsType()->isVariablyModifiedType())
+    if (Arg.getKind() == TemplateArgument::Type &&
+        Arg.getAsType()->isVariablyModifiedType())
       setVariablyModified();
-    if (Args[Arg].containsUnexpandedParameterPack())
+    if (Arg.containsUnexpandedParameterPack())
       setContainsUnexpandedParameterPack();
-    new (&TemplateArgs[Arg]) TemplateArgument(Args[Arg]);
+    new (TemplateArgs++) TemplateArgument(Arg);
   }
 
   // Store the aliased type if this is a type alias template specialization.
@@ -3168,12 +3222,11 @@ TemplateSpecializationType(TemplateName T,
 void
 TemplateSpecializationType::Profile(llvm::FoldingSetNodeID &ID,
                                     TemplateName T,
-                                    const TemplateArgument *Args,
-                                    unsigned NumArgs,
+                                    ArrayRef<TemplateArgument> Args,
                                     const ASTContext &Context) {
   T.Profile(ID);
-  for (unsigned Idx = 0; Idx < NumArgs; ++Idx)
-    Args[Idx].Profile(ID, Context);
+  for (const TemplateArgument &Arg : Args)
+    Arg.Profile(ID, Context);
 }
 
 QualType
@@ -3211,6 +3264,20 @@ void ObjCObjectTypeImpl::Profile(llvm::FoldingSetNodeID &ID) {
   Profile(ID, getBaseType(), getTypeArgsAsWritten(),
           llvm::makeArrayRef(qual_begin(), getNumProtocols()),
           isKindOfTypeAsWritten());
+}
+
+void ObjCTypeParamType::Profile(llvm::FoldingSetNodeID &ID,
+                                const ObjCTypeParamDecl *OTPDecl,
+                                ArrayRef<ObjCProtocolDecl *> protocols) {
+  ID.AddPointer(OTPDecl);
+  ID.AddInteger(protocols.size());
+  for (auto proto : protocols)
+    ID.AddPointer(proto);
+}
+
+void ObjCTypeParamType::Profile(llvm::FoldingSetNodeID &ID) {
+  Profile(ID, getDecl(),
+          llvm::makeArrayRef(qual_begin(), getNumProtocols()));
 }
 
 namespace {
@@ -3688,10 +3755,18 @@ bool Type::isObjCARCImplicitlyUnretainedType() const {
 }
 
 bool Type::isObjCNSObjectType() const {
-  if (const TypedefType *typedefType = dyn_cast<TypedefType>(this))
-    return typedefType->getDecl()->hasAttr<ObjCNSObjectAttr>();
-  return false;
+  const Type *cur = this;
+  while (true) {
+    if (const TypedefType *typedefType = dyn_cast<TypedefType>(cur))
+      return typedefType->getDecl()->hasAttr<ObjCNSObjectAttr>();
+
+    // Single-step desugar until we run out of sugar.
+    QualType next = cur->getLocallyUnqualifiedSingleStepDesugaredType();
+    if (next.getTypePtr() == cur) return false;
+    cur = next.getTypePtr();
+  }
 }
+
 bool Type::isObjCIndependentClassType() const {
   if (const TypedefType *typedefType = dyn_cast<TypedefType>(this))
     return typedefType->getDecl()->hasAttr<ObjCIndependentClassAttr>();

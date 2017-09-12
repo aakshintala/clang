@@ -188,6 +188,7 @@ void *EHScopeStack::pushCleanup(CleanupKind Kind, size_t Size) {
   bool IsNormalCleanup = Kind & NormalCleanup;
   bool IsEHCleanup = Kind & EHCleanup;
   bool IsActive = !(Kind & InactiveCleanup);
+  bool IsLifetimeMarker = Kind & LifetimeMarker;
   EHCleanupScope *Scope =
     new (Buffer) EHCleanupScope(IsNormalCleanup,
                                 IsEHCleanup,
@@ -200,6 +201,8 @@ void *EHScopeStack::pushCleanup(CleanupKind Kind, size_t Size) {
     InnermostNormalCleanup = stable_begin();
   if (IsEHCleanup)
     InnermostEHScope = stable_begin();
+  if (IsLifetimeMarker)
+    Scope->setLifetimeMarker();
 
   return Scope->getCleanupBuffer();
 }
@@ -442,7 +445,7 @@ CodeGenFunction::PopCleanupBlocks(EHScopeStack::stable_iterator Old,
   for (size_t I = OldLifetimeExtendedSize,
               E = LifetimeExtendedCleanupStack.size(); I != E; /**/) {
     // Alignment should be guaranteed by the vptrs in the individual cleanups.
-    assert((I % llvm::alignOf<LifetimeExtendedCleanupHeader>() == 0) &&
+    assert((I % alignof(LifetimeExtendedCleanupHeader) == 0) &&
            "misaligned cleanup stack entry");
 
     LifetimeExtendedCleanupHeader &Header =

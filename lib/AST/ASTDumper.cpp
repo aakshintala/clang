@@ -428,6 +428,8 @@ namespace  {
     void VisitFunctionDecl(const FunctionDecl *D);
     void VisitFieldDecl(const FieldDecl *D);
     void VisitVarDecl(const VarDecl *D);
+    void VisitDecompositionDecl(const DecompositionDecl *D);
+    void VisitBindingDecl(const BindingDecl *D);
     void VisitFileScopeAsmDecl(const FileScopeAsmDecl *D);
     void VisitImportDecl(const ImportDecl *D);
     void VisitPragmaCommentDecl(const PragmaCommentDecl *D);
@@ -474,6 +476,7 @@ namespace  {
     void VisitUnresolvedUsingTypenameDecl(const UnresolvedUsingTypenameDecl *D);
     void VisitUnresolvedUsingValueDecl(const UnresolvedUsingValueDecl *D);
     void VisitUsingShadowDecl(const UsingShadowDecl *D);
+    void VisitConstructorUsingShadowDecl(const ConstructorUsingShadowDecl *D);
     void VisitLinkageSpecDecl(const LinkageSpecDecl *D);
     void VisitAccessSpecDecl(const AccessSpecDecl *D);
     void VisitFriendDecl(const FriendDecl *D);
@@ -514,6 +517,8 @@ namespace  {
     void VisitFloatingLiteral(const FloatingLiteral *Node);
     void VisitStringLiteral(const StringLiteral *Str);
     void VisitInitListExpr(const InitListExpr *ILE);
+    void VisitArrayInitLoopExpr(const ArrayInitLoopExpr *ILE);
+    void VisitArrayInitIndexExpr(const ArrayInitIndexExpr *ILE);
     void VisitUnaryOperator(const UnaryOperator *Node);
     void VisitUnaryExprOrTypeTraitExpr(const UnaryExprOrTypeTraitExpr *Node);
     void VisitMemberExpr(const MemberExpr *Node);
@@ -542,6 +547,8 @@ namespace  {
       dumpDecl(Node->getLambdaClass());
     }
     void VisitSizeOfPackExpr(const SizeOfPackExpr *Node);
+    void
+    VisitCXXDependentScopeMemberExpr(const CXXDependentScopeMemberExpr *Node);
 
     // ObjC
     void VisitObjCAtCatchStmt(const ObjCAtCatchStmt *Node);
@@ -713,6 +720,12 @@ void ASTDumper::dumpTypeAsChild(const Type *T) {
 }
 
 void ASTDumper::dumpBareDeclRef(const Decl *D) {
+  if (!D) {
+    ColorScope Color(*this, NullColor);
+    OS << "<<<NULL>>>";
+    return;
+  }
+
   {
     ColorScope Color(*this, DeclKindNameColor);
     OS << D->getDeclKindName();
@@ -1126,8 +1139,15 @@ void ASTDumper::VisitFunctionDecl(const FunctionDecl *D) {
 
   if (D->isPure())
     OS << " pure";
-  else if (D->isDeletedAsWritten())
+  if (D->isDefaulted()) {
+    OS << " default";
+    if (D->isDeleted())
+      OS << "_delete";
+  }
+  if (D->isDeletedAsWritten())
     OS << " delete";
+  if (D->isTrivial())
+    OS << " trivial";
 
   if (const FunctionProtoType *FPT = D->getType()->getAs<FunctionProtoType>()) {
     FunctionProtoType::ExtProtoInfo EPI = FPT->getExtProtoInfo();
@@ -1145,11 +1165,6 @@ void ASTDumper::VisitFunctionDecl(const FunctionDecl *D) {
   if (const FunctionTemplateSpecializationInfo *FTSI =
           D->getTemplateSpecializationInfo())
     dumpTemplateArgumentList(*FTSI->TemplateArguments);
-
-  for (ArrayRef<NamedDecl *>::iterator
-       I = D->getDeclsInPrototypeScope().begin(),
-       E = D->getDeclsInPrototypeScope().end(); I != E; ++I)
-    dumpDecl(*I);
 
   if (!D->param_begin() && D->getNumParams())
     dumpChild([=] { OS << "<<NULL params x " << D->getNumParams() << ">>"; });
@@ -1208,6 +1223,19 @@ void ASTDumper::VisitVarDecl(const VarDecl *D) {
     }
     dumpStmt(D->getInit());
   }
+}
+
+void ASTDumper::VisitDecompositionDecl(const DecompositionDecl *D) {
+  VisitVarDecl(D);
+  for (auto *B : D->bindings())
+    dumpDecl(B);
+}
+
+void ASTDumper::VisitBindingDecl(const BindingDecl *D) {
+  dumpName(D);
+  dumpType(D->getType());
+  if (auto *E = D->getBinding())
+    dumpStmt(E);
 }
 
 void ASTDumper::VisitFileScopeAsmDecl(const FileScopeAsmDecl *D) {
@@ -1489,6 +1517,31 @@ void ASTDumper::VisitUsingShadowDecl(const UsingShadowDecl *D) {
   dumpBareDeclRef(D->getTargetDecl());
   if (auto *TD = dyn_cast<TypeDecl>(D->getUnderlyingDecl()))
     dumpTypeAsChild(TD->getTypeForDecl());
+}
+
+void ASTDumper::VisitConstructorUsingShadowDecl(
+    const ConstructorUsingShadowDecl *D) {
+  if (D->constructsVirtualBase())
+    OS << " virtual";
+
+  dumpChild([=] {
+    OS << "target ";
+    dumpBareDeclRef(D->getTargetDecl());
+  });
+
+  dumpChild([=] {
+    OS << "nominated ";
+    dumpBareDeclRef(D->getNominatedBaseClass());
+    OS << ' ';
+    dumpBareDeclRef(D->getNominatedBaseClassShadowDecl());
+  });
+
+  dumpChild([=] {
+    OS << "constructed ";
+    dumpBareDeclRef(D->getConstructedBaseClass());
+    OS << ' ';
+    dumpBareDeclRef(D->getConstructedBaseClassShadowDecl());
+  });
 }
 
 void ASTDumper::VisitLinkageSpecDecl(const LinkageSpecDecl *D) {
@@ -1973,6 +2026,14 @@ void ASTDumper::VisitInitListExpr(const InitListExpr *ILE) {
   }
 }
 
+void ASTDumper::VisitArrayInitLoopExpr(const ArrayInitLoopExpr *E) {
+  VisitExpr(E);
+}
+
+void ASTDumper::VisitArrayInitIndexExpr(const ArrayInitIndexExpr *E) {
+  VisitExpr(E);
+}
+
 void ASTDumper::VisitUnaryOperator(const UnaryOperator *Node) {
   VisitExpr(Node);
   OS << " " << (Node->isPostfix() ? "postfix" : "prefix")
@@ -2147,6 +2208,11 @@ void ASTDumper::VisitSizeOfPackExpr(const SizeOfPackExpr *Node) {
       dumpTemplateArgument(A);
 }
 
+void ASTDumper::VisitCXXDependentScopeMemberExpr(
+    const CXXDependentScopeMemberExpr *Node) {
+  VisitExpr(Node);
+  OS << " " << (Node->isArrow() ? "->" : ".") << Node->getMember();
+}
 
 //===----------------------------------------------------------------------===//
 // Obj-C Expressions
@@ -2419,12 +2485,18 @@ void QualType::dump(const char *msg) const {
   dump();
 }
 
-LLVM_DUMP_METHOD void QualType::dump() const {
-  ASTDumper Dumper(llvm::errs(), nullptr, nullptr);
+LLVM_DUMP_METHOD void QualType::dump() const { dump(llvm::errs()); }
+
+LLVM_DUMP_METHOD void QualType::dump(llvm::raw_ostream &OS) const {
+  ASTDumper Dumper(OS, nullptr, nullptr);
   Dumper.dumpTypeAsChild(*this);
 }
 
-LLVM_DUMP_METHOD void Type::dump() const { QualType(this, 0).dump(); }
+LLVM_DUMP_METHOD void Type::dump() const { dump(llvm::errs()); }
+
+LLVM_DUMP_METHOD void Type::dump(llvm::raw_ostream &OS) const {
+  QualType(this, 0).dump(OS);
+}
 
 //===----------------------------------------------------------------------===//
 // Decl method implementations

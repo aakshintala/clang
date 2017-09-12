@@ -239,7 +239,8 @@ static Stmt *create_dispatch_once(ASTContext &C, const FunctionDecl *D) {
                                            SourceLocation());
   
   // (5) Create the 'if' statement.
-  IfStmt *If = new (C) IfStmt(C, SourceLocation(), false, nullptr, UO, CS);
+  IfStmt *If = new (C) IfStmt(C, SourceLocation(), false, nullptr, nullptr,
+                              UO, CS);
   return If;
 }
 
@@ -342,9 +343,8 @@ static Stmt *create_OSAtomicCompareAndSwap(ASTContext &C, const FunctionDecl *D)
   Stmt *Else = M.makeReturn(RetVal);
   
   /// Construct the If.
-  Stmt *If =
-    new (C) IfStmt(C, SourceLocation(), false, nullptr, Comparison, Body,
-                   SourceLocation(), Else);
+  Stmt *If = new (C) IfStmt(C, SourceLocation(), false, nullptr, nullptr,
+                            Comparison, Body, SourceLocation(), Else);
 
   return If;  
 }
@@ -467,6 +467,8 @@ static Stmt *createObjCPropertyGetter(ASTContext &Ctx,
   ASTMaker M(Ctx);
 
   const VarDecl *selfVar = Prop->getGetterMethodDecl()->getSelfDecl();
+  if (!selfVar)
+    return nullptr;
 
   Expr *loadedIVar =
     M.makeObjCIvarRef(

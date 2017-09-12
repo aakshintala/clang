@@ -1,8 +1,6 @@
-// RUN: %clang_cc1 %s -triple=x86_64-apple-darwin -target-feature +sse4.1 -emit-llvm -o - -Werror | FileCheck %s
-// RUN: %clang_cc1 %s -triple=x86_64-apple-darwin -target-feature +sse4.1 -fno-signed-char -emit-llvm -o - -Werror | FileCheck %s
+// RUN: %clang_cc1 -ffreestanding %s -triple=x86_64-apple-darwin -target-feature +sse4.1 -emit-llvm -o - -Wall -Werror | FileCheck %s
+// RUN: %clang_cc1 -ffreestanding %s -triple=x86_64-apple-darwin -target-feature +sse4.1 -fno-signed-char -emit-llvm -o - -Wall -Werror | FileCheck %s
 
-// Don't include mm_malloc.h, it's system specific.
-#define __MM_MALLOC_H
 
 #include <x86intrin.h>
 
@@ -190,10 +188,11 @@ long long test_mm_extract_epi64(__m128i x) {
   return _mm_extract_epi64(x, 1);
 }
 
-//TODO
-//int test_mm_extract_ps(__m128 x) {
-//  return _mm_extract_ps(_mm_add_ps(x,x), 1);
-//}
+int test_mm_extract_ps(__m128 x) {
+  // CHECK-LABEL: test_mm_extract_ps
+  // CHECK: extractelement <4 x float> %{{.*}}, i32 1
+  return _mm_extract_ps(x, 1);
+}
 
 __m128d test_mm_floor_pd(__m128d x) {
   // CHECK-LABEL: test_mm_floor_pd

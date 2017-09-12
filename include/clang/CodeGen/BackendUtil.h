@@ -21,6 +21,7 @@ namespace llvm {
 
 namespace clang {
   class DiagnosticsEngine;
+  class HeaderSearchOptions;
   class CodeGenOptions;
   class TargetOptions;
   class LangOptions;
@@ -34,10 +35,12 @@ namespace clang {
     Backend_EmitObj        ///< Emit native object files
   };
 
-  void EmitBackendOutput(DiagnosticsEngine &Diags, const CodeGenOptions &CGOpts,
+  void EmitBackendOutput(DiagnosticsEngine &Diags, const HeaderSearchOptions &,
+                         const CodeGenOptions &CGOpts,
                          const TargetOptions &TOpts, const LangOptions &LOpts,
                          const llvm::DataLayout &TDesc, llvm::Module *M,
-                         BackendAction Action, raw_pwrite_stream *OS);
+                         BackendAction Action,
+                         std::unique_ptr<raw_pwrite_stream> OS);
 
   void EmbedBitcode(llvm::Module *M, const CodeGenOptions &CGOpts,
                     llvm::MemoryBufferRef Buf);

@@ -275,7 +275,7 @@ void TokenLexer::ExpandFunctionArguments() {
 
       // If the arg token expanded into anything, append it.
       if (ResultArgToks->isNot(tok::eof)) {
-        unsigned FirstResult = ResultToks.size();
+        size_t FirstResult = ResultToks.size();
         unsigned NumToks = MacroArgs::getArgLength(ResultArgToks);
         ResultToks.append(ResultArgToks, ResultArgToks+NumToks);
 
@@ -289,8 +289,8 @@ void TokenLexer::ExpandFunctionArguments() {
 
         // If the '##' came from expanding an argument, turn it into 'unknown'
         // to avoid pasting.
-        for (unsigned i = FirstResult, e = ResultToks.size(); i != e; ++i) {
-          Token &Tok = ResultToks[i];
+        for (Token &Tok : llvm::make_range(ResultToks.begin() + FirstResult,
+                                           ResultToks.end())) {
           if (Tok.is(tok::hashhash))
             Tok.setKind(tok::unknown);
         }
@@ -333,9 +333,8 @@ void TokenLexer::ExpandFunctionArguments() {
 
       // If the '##' came from expanding an argument, turn it into 'unknown'
       // to avoid pasting.
-      for (unsigned i = ResultToks.size() - NumToks, e = ResultToks.size();
-             i != e; ++i) {
-        Token &Tok = ResultToks[i];
+      for (Token &Tok : llvm::make_range(ResultToks.end() - NumToks,
+                                         ResultToks.end())) {
         if (Tok.is(tok::hashhash))
           Tok.setKind(tok::unknown);
       }
@@ -787,9 +786,6 @@ static void updateConsecutiveMacroArgTokens(SourceManager &SM,
     if (CurLoc.isFileID() != NextLoc.isFileID())
       break; // Token from different kind of FileID.
 
-    if (CurLoc.isMacroID() && !SM.isWrittenInSameFile(CurLoc, NextLoc))
-      break; // Token from a different macro.
-
     int RelOffs;
     if (!SM.isInSameSLocAddrSpace(CurLoc, NextLoc, &RelOffs))
       break; // Token from different local/loaded location.
@@ -797,6 +793,10 @@ static void updateConsecutiveMacroArgTokens(SourceManager &SM,
     // "characters" away.
     if (RelOffs < 0 || RelOffs > 50)
       break;
+
+    if (CurLoc.isMacroID() && !SM.isWrittenInSameFile(CurLoc, NextLoc))
+      break; // Token from a different macro.
+
     CurLoc = NextLoc;
   }
 

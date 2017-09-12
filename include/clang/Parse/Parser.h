@@ -14,6 +14,7 @@
 #ifndef LLVM_CLANG_PARSE_PARSER_H
 #define LLVM_CLANG_PARSE_PARSER_H
 
+#include "clang/AST/Availability.h"
 #include "clang/Basic/OpenMPKinds.h"
 #include "clang/Basic/OperatorPrecedence.h"
 #include "clang/Basic/Specifiers.h"
@@ -73,7 +74,8 @@ class Parser : public CodeCompletionHandler {
   // a statement).
   SourceLocation PrevTokLocation;
 
-  unsigned short ParenCount, BracketCount, BraceCount;
+  unsigned short ParenCount = 0, BracketCount = 0, BraceCount = 0;
+  unsigned short MisplacedModuleBeginCount = 0;
 
   /// Actions - These are the callbacks we invoke as we parse various constructs
   /// in the file.
@@ -142,6 +144,7 @@ class Parser : public CodeCompletionHandler {
 
   /// C++0x contextual keywords.
   mutable IdentifierInfo *Ident_final;
+  mutable IdentifierInfo *Ident_GNU_final;
   mutable IdentifierInfo *Ident_override;
 
   // C++ type trait keywords that can be reverted to identifiers and still be
@@ -170,6 +173,8 @@ class Parser : public CodeCompletionHandler {
   std::unique_ptr<PragmaHandler> MSCodeSeg;
   std::unique_ptr<PragmaHandler> MSSection;
   std::unique_ptr<PragmaHandler> MSRuntimeChecks;
+  std::unique_ptr<PragmaHandler> MSIntrinsic;
+  std::unique_ptr<PragmaHandler> CUDAForceHostDeviceHandler;
   std::unique_ptr<PragmaHandler> OptimizeHandler;
   std::unique_ptr<PragmaHandler> LoopHintHandler;
   std::unique_ptr<PragmaHandler> UnrollHintHandler;
@@ -243,6 +248,11 @@ class Parser : public CodeCompletionHandler {
 
   bool SkipFunctionBodies;
 
+  /// The location of the expression statement that is being parsed right now.
+  /// Used to determine if an expression that is being parsed is a statement or
+  /// just a regular sub-expression.
+  SourceLocation ExprStatementTokLoc;
+
 public:
   Parser(Preprocessor &PP, Sema &Actions, bool SkipFunctionBodies);
   ~Parser() override;
@@ -275,6 +285,9 @@ public:
   /// Initialize - Warm up the parser.
   ///
   void Initialize();
+
+  /// Parse the first top-level declaration in a translation unit.
+  bool ParseFirstTopLevelDecl(DeclGroupPtrTy &Result);
 
   /// ParseTopLevelDecl - Parse one top-level declaration. Returns true if
   /// the EOF was encountered.
@@ -311,6 +324,10 @@ public:
       return false;
     Loc = PrevTokLocation;
     return true;
+  }
+
+  SourceLocation getEndOfPreviousToken() {
+    return PP.getLocForEndOfToken(PrevTokLocation);
   }
 
   /// Retrieve the underscored keyword (_Nonnull, _Nullable) that corresponds
@@ -583,11 +600,8 @@ private:
 public:
   // If NeedType is true, then TryAnnotateTypeOrScopeToken will try harder to
   // find a type name by attempting typo correction.
-  bool TryAnnotateTypeOrScopeToken(bool EnteringContext = false,
-                                   bool NeedType = false);
-  bool TryAnnotateTypeOrScopeTokenAfterScopeSpec(bool EnteringContext,
-                                                 bool NeedType,
-                                                 CXXScopeSpec &SS,
+  bool TryAnnotateTypeOrScopeToken();
+  bool TryAnnotateTypeOrScopeTokenAfterScopeSpec(CXXScopeSpec &SS,
                                                  bool IsNewScope);
   bool TryAnnotateCXXScopeToken(bool EnteringContext = false);
 
@@ -715,6 +729,16 @@ private:
       assert(!isActive && "Forgot to call Commit or Revert!");
     }
   };
+  /// A TentativeParsingAction that automatically reverts in its destructor.
+  /// Useful for disambiguation parses that will always be reverted.
+  class RevertingTentativeParsingAction
+      : private Parser::TentativeParsingAction {
+  public:
+    RevertingTentativeParsingAction(Parser &P)
+        : Parser::TentativeParsingAction(P) {}
+    ~RevertingTentativeParsingAction() { Revert(); }
+  };
+
   class UnannotatedTentativeParsingAction;
 
   /// ObjCDeclContextSwitch - An object used to switch context from
@@ -857,8 +881,8 @@ public:
     StopAtCodeCompletion = 1 << 2 ///< Stop at code completion
   };
 
-  friend LLVM_CONSTEXPR SkipUntilFlags operator|(SkipUntilFlags L,
-                                                 SkipUntilFlags R) {
+  friend constexpr SkipUntilFlags operator|(SkipUntilFlags L,
+                                            SkipUntilFlags R) {
     return static_cast<SkipUntilFlags>(static_cast<unsigned>(L) |
                                        static_cast<unsigned>(R));
   }
@@ -991,8 +1015,8 @@ private:
   /// (C++ [class.mem]p2).
   struct LateParsedDefaultArgument {
     explicit LateParsedDefaultArgument(Decl *P,
-                                       CachedTokens *Toks = nullptr)
-      : Param(P), Toks(Toks) { }
+                                       std::unique_ptr<CachedTokens> Toks = nullptr)
+      : Param(P), Toks(std::move(Toks)) { }
 
     /// Param - The parameter declaration for this parameter.
     Decl *Param;
@@ -1001,7 +1025,7 @@ private:
     /// argument expression, not including the '=' or the terminating
     /// ')' or ','. This will be NULL for parameters that have no
     /// default argument.
-    CachedTokens *Toks;
+    std::unique_ptr<CachedTokens> Toks;
   };
 
   /// LateParsedMethodDeclaration - A method declaration inside a class that
@@ -1233,6 +1257,11 @@ private:
   struct ParsedAttributesWithRange : ParsedAttributes {
     ParsedAttributesWithRange(AttributeFactory &factory)
       : ParsedAttributes(factory) {}
+
+    void clear() {
+      ParsedAttributes::clear();
+      Range = SourceRange();
+    }
 
     SourceRange Range;
   };
@@ -1503,8 +1532,6 @@ private:
                                       bool IsTypename = false,
                                       IdentifierInfo **LastII = nullptr);
 
-  void CheckForLParenAfterColonColon();
-
   //===--------------------------------------------------------------------===//
   // C++0x 5.1.2: Lambda expressions
 
@@ -1588,7 +1615,8 @@ private:
 
   //===--------------------------------------------------------------------===//
   // C++ if/switch/while condition expression.
-  Sema::ConditionResult ParseCXXCondition(SourceLocation Loc,
+  Sema::ConditionResult ParseCXXCondition(StmtResult *InitStmt,
+                                          SourceLocation Loc,
                                           Sema::ConditionKind CK);
 
   //===--------------------------------------------------------------------===//
@@ -1680,7 +1708,8 @@ private:
                                     unsigned ScopeFlags);
   void ParseCompoundStatementLeadingPragmas();
   StmtResult ParseCompoundStatementBody(bool isStmtExpr = false);
-  bool ParseParenExprOrCondition(Sema::ConditionResult &CondResult,
+  bool ParseParenExprOrCondition(StmtResult *InitStmt,
+                                 Sema::ConditionResult &CondResult,
                                  SourceLocation Loc,
                                  Sema::ConditionKind CK);
   StmtResult ParseIfStatement(SourceLocation *TrailingElseLoc);
@@ -1974,11 +2003,18 @@ private:
   /// the function returns true to let the declaration parsing code handle it.
   bool isCXXFunctionDeclarator(bool *IsAmbiguous = nullptr);
 
-  /// isCXXConditionDeclaration - Disambiguates between a declaration or an
-  /// expression for a condition of a if/switch/while/for statement.
-  /// If during the disambiguation process a parsing error is encountered,
-  /// the function returns true to let the declaration parsing code handle it.
-  bool isCXXConditionDeclaration();
+  struct ConditionDeclarationOrInitStatementState;
+  enum class ConditionOrInitStatement {
+    Expression,    ///< Disambiguated as an expression (either kind).
+    ConditionDecl, ///< Disambiguated as the declaration form of condition.
+    InitStmtDecl,  ///< Disambiguated as a simple-declaration init-statement.
+    Error          ///< Can't be any of the above!
+  };
+  /// \brief Disambiguates between the different kinds of things that can happen
+  /// after 'if (' or 'switch ('. This could be one of two different kinds of
+  /// declaration (depending on whether there is a ';' later) or an expression.
+  ConditionOrInitStatement
+  isCXXConditionDeclarationOrInitStatement(bool CanBeInitStmt);
 
   bool isCXXTypeId(TentativeCXXTypeIdContext Context, bool &isAmbiguous);
   bool isCXXTypeId(TentativeCXXTypeIdContext Context) {
@@ -2078,8 +2114,8 @@ private:
   void DiagnoseMisplacedCXX11Attribute(ParsedAttributesWithRange &Attrs,
                                        SourceLocation CorrectLocation);
 
-  void handleDeclspecAlignBeforeClassKey(ParsedAttributesWithRange &Attrs,
-                                         DeclSpec &DS, Sema::TagUseKind TUK);
+  void stripTypeAttributesOffDeclSpec(ParsedAttributesWithRange &Attrs,
+                                      DeclSpec &DS, Sema::TagUseKind TUK);
 
   void ProhibitAttributes(ParsedAttributesWithRange &attrs) {
     if (!attrs.Range.isValid()) return;
@@ -2091,7 +2127,8 @@ private:
   // Forbid C++11 attributes that appear on certain syntactic 
   // locations which standard permits but we don't supported yet, 
   // for example, attributes appertain to decl specifiers.
-  void ProhibitCXX11Attributes(ParsedAttributesWithRange &attrs);
+  void ProhibitCXX11Attributes(ParsedAttributesWithRange &Attrs,
+                               unsigned DiagID);
 
   /// \brief Skip C++11 attributes and return the end location of the last one.
   /// \returns SourceLocation() if there are no attributes.
@@ -2183,6 +2220,7 @@ private:
     if (getLangOpts().MicrosoftExt && Tok.is(tok::l_square))
       ParseMicrosoftAttributes(attrs, endLoc);
   }
+  void ParseMicrosoftUuidAttributeArgs(ParsedAttributes &Attrs);
   void ParseMicrosoftAttributes(ParsedAttributes &attrs,
                                 SourceLocation *endLoc = nullptr);
   void MaybeParseMicrosoftDeclSpecs(ParsedAttributes &Attrs,
@@ -2224,6 +2262,9 @@ private:
                                   IdentifierInfo *ScopeName,
                                   SourceLocation ScopeLoc,
                                   AttributeList::Syntax Syntax);
+
+  Optional<AvailabilitySpec> ParseAvailabilitySpec();
+  ExprResult ParseAvailabilityCheckExpr(SourceLocation StartLoc);
 
   void ParseObjCBridgeRelatedAttribute(IdentifierInfo &ObjCBridgeRelated,
                                        SourceLocation ObjCBridgeRelatedLoc,
@@ -2329,6 +2370,7 @@ private:
                                  bool AtomicAllowed = true,
                                  bool IdentifierRequired = false);
   void ParseDirectDeclarator(Declarator &D);
+  void ParseDecompositionDeclarator(Declarator &D);
   void ParseParenDeclarator(Declarator &D);
   void ParseFunctionDeclarator(Declarator &D,
                                ParsedAttributes &attrs,
@@ -2377,21 +2419,40 @@ private:
                            ParsedAttributes& attrs,
                            BalancedDelimiterTracker &Tracker);
   Decl *ParseLinkage(ParsingDeclSpec &DS, unsigned Context);
-  Decl *ParseUsingDirectiveOrDeclaration(unsigned Context,
-                                         const ParsedTemplateInfo &TemplateInfo,
-                                         SourceLocation &DeclEnd,
-                                         ParsedAttributesWithRange &attrs,
-                                         Decl **OwnedType = nullptr);
+  Decl *ParseExportDeclaration();
+  DeclGroupPtrTy ParseUsingDirectiveOrDeclaration(
+      unsigned Context, const ParsedTemplateInfo &TemplateInfo,
+      SourceLocation &DeclEnd, ParsedAttributesWithRange &attrs);
   Decl *ParseUsingDirective(unsigned Context,
                             SourceLocation UsingLoc,
                             SourceLocation &DeclEnd,
                             ParsedAttributes &attrs);
-  Decl *ParseUsingDeclaration(unsigned Context,
-                              const ParsedTemplateInfo &TemplateInfo,
-                              SourceLocation UsingLoc,
-                              SourceLocation &DeclEnd,
-                              AccessSpecifier AS = AS_none,
-                              Decl **OwnedType = nullptr);
+
+  struct UsingDeclarator {
+    SourceLocation TypenameLoc;
+    CXXScopeSpec SS;
+    SourceLocation TemplateKWLoc;
+    UnqualifiedId Name;
+    SourceLocation EllipsisLoc;
+
+    void clear() {
+      TypenameLoc = TemplateKWLoc = EllipsisLoc = SourceLocation();
+      SS.clear();
+      Name.clear();
+    }
+  };
+
+  bool ParseUsingDeclarator(unsigned Context, UsingDeclarator &D);
+  DeclGroupPtrTy ParseUsingDeclaration(unsigned Context,
+                                       const ParsedTemplateInfo &TemplateInfo,
+                                       SourceLocation UsingLoc,
+                                       SourceLocation &DeclEnd,
+                                       AccessSpecifier AS = AS_none);
+  Decl *ParseAliasDeclarationAfterDeclarator(
+      const ParsedTemplateInfo &TemplateInfo, SourceLocation UsingLoc,
+      UsingDeclarator &D, SourceLocation &DeclEnd, AccessSpecifier AS,
+      ParsedAttributes &Attrs, Decl **OwnedType = nullptr);
+
   Decl *ParseStaticAssertDeclaration(SourceLocation &DeclEnd);
   Decl *ParseNamespaceAlias(SourceLocation NamespaceLoc,
                             SourceLocation AliasLoc, IdentifierInfo *Alias,
@@ -2626,6 +2687,7 @@ private:
 
   //===--------------------------------------------------------------------===//
   // Modules
+  DeclGroupPtrTy ParseModuleDecl();
   DeclGroupPtrTy ParseModuleImport(SourceLocation AtLoc);
   bool parseMisplacedModuleImport();
   bool tryParseMisplacedModuleImport() {
@@ -2635,6 +2697,11 @@ private:
       return parseMisplacedModuleImport();
     return false;
   }
+
+  bool ParseModuleName(
+      SourceLocation UseLoc,
+      SmallVectorImpl<std::pair<IdentifierInfo *, SourceLocation>> &Path,
+      bool IsImport);
 
   //===--------------------------------------------------------------------===//
   // C++11/G++: Type Traits [Type-Traits.html in the GCC manual]

@@ -194,6 +194,7 @@ bool TypePrinter::canPrefixQualifiers(const Type *T,
     case Type::DependentName:
     case Type::DependentTemplateSpecialization:
     case Type::ObjCObject:
+    case Type::ObjCTypeParam:
     case Type::ObjCInterface:
     case Type::Atomic:
     case Type::Pipe:
@@ -724,8 +725,11 @@ void TypePrinter::printFunctionProtoAfter(const FunctionProtoType *T,
     case CC_X86_64SysV:
       OS << " __attribute__((sysv_abi))";
       break;
+    case CC_X86RegCall:
+      OS << " __attribute__((regcall))";
+      break;
     case CC_SpirFunction:
-    case CC_SpirKernel:
+    case CC_OpenCLKernel:
       // Do nothing. These CCs are not available as attributes.
       break;
     case CC_Swift:
@@ -897,6 +901,10 @@ void TypePrinter::printAtomicAfter(const AtomicType *T, raw_ostream &OS) { }
 void TypePrinter::printPipeBefore(const PipeType *T, raw_ostream &OS) {
   IncludeStrongLifetimeRAII Strong(Policy);
 
+  if (T->isReadOnly())
+    OS << "read_only ";
+  else
+    OS << "write_only ";
   OS << "pipe ";
   print(T->getElementType(), OS, StringRef());
   spaceBeforePlaceHolder(OS);
@@ -923,10 +931,8 @@ void TypePrinter::AppendScope(DeclContext *DC, raw_ostream &OS) {
     IncludeStrongLifetimeRAII Strong(Policy);
     OS << Spec->getIdentifier()->getName();
     const TemplateArgumentList &TemplateArgs = Spec->getTemplateArgs();
-    TemplateSpecializationType::PrintTemplateArgumentList(OS,
-                                            TemplateArgs.data(),
-                                            TemplateArgs.size(),
-                                            Policy);
+    TemplateSpecializationType::PrintTemplateArgumentList(
+        OS, TemplateArgs.asArray(), Policy);
     OS << "::";
   } else if (TagDecl *Tag = dyn_cast<TagDecl>(DC)) {
     if (TypedefNameDecl *Typedef = Tag->getTypedefNameForAnonDecl())
@@ -1003,22 +1009,17 @@ void TypePrinter::printTag(TagDecl *D, raw_ostream &OS) {
   // arguments.
   if (ClassTemplateSpecializationDecl *Spec
         = dyn_cast<ClassTemplateSpecializationDecl>(D)) {
-    const TemplateArgument *Args;
-    unsigned NumArgs;
+    ArrayRef<TemplateArgument> Args;
     if (TypeSourceInfo *TAW = Spec->getTypeAsWritten()) {
       const TemplateSpecializationType *TST =
         cast<TemplateSpecializationType>(TAW->getType());
-      Args = TST->getArgs();
-      NumArgs = TST->getNumArgs();
+      Args = TST->template_arguments();
     } else {
       const TemplateArgumentList &TemplateArgs = Spec->getTemplateArgs();
-      Args = TemplateArgs.data();
-      NumArgs = TemplateArgs.size();
+      Args = TemplateArgs.asArray();
     }
     IncludeStrongLifetimeRAII Strong(Policy);
-    TemplateSpecializationType::PrintTemplateArgumentList(OS,
-                                                          Args, NumArgs,
-                                                          Policy);
+    TemplateSpecializationType::PrintTemplateArgumentList(OS, Args, Policy);
   }
 
   spaceBeforePlaceHolder(OS);
@@ -1076,11 +1077,9 @@ void TypePrinter::printTemplateSpecializationBefore(
                                             raw_ostream &OS) { 
   IncludeStrongLifetimeRAII Strong(Policy);
   T->getTemplateName().print(OS, Policy);
-  
-  TemplateSpecializationType::PrintTemplateArgumentList(OS,
-                                                        T->getArgs(), 
-                                                        T->getNumArgs(), 
-                                                        Policy);
+
+  TemplateSpecializationType::PrintTemplateArgumentList(
+      OS, T->template_arguments(), Policy);
   spaceBeforePlaceHolder(OS);
 }
 void TypePrinter::printTemplateSpecializationAfter(
@@ -1157,8 +1156,7 @@ void TypePrinter::printDependentTemplateSpecializationBefore(
     T->getQualifier()->print(OS, Policy);    
   OS << T->getIdentifier()->getName();
   TemplateSpecializationType::PrintTemplateArgumentList(OS,
-                                                        T->getArgs(),
-                                                        T->getNumArgs(),
+                                                        T->template_arguments(),
                                                         Policy);
   spaceBeforePlaceHolder(OS);
 }
@@ -1348,6 +1346,7 @@ void TypePrinter::printAttributedAfter(const AttributedType *T,
   case AttributedType::attr_pascal: OS << "pascal"; break;
   case AttributedType::attr_ms_abi: OS << "ms_abi"; break;
   case AttributedType::attr_sysv_abi: OS << "sysv_abi"; break;
+  case AttributedType::attr_regcall: OS << "regcall"; break;
   case AttributedType::attr_pcs:
   case AttributedType::attr_pcs_vfp: {
     OS << "pcs(";
@@ -1377,6 +1376,28 @@ void TypePrinter::printObjCInterfaceBefore(const ObjCInterfaceType *T,
 }
 void TypePrinter::printObjCInterfaceAfter(const ObjCInterfaceType *T, 
                                           raw_ostream &OS) { } 
+
+void TypePrinter::printObjCTypeParamBefore(const ObjCTypeParamType *T,
+                                          raw_ostream &OS) {
+  OS << T->getDecl()->getName();
+  if (!T->qual_empty()) {
+    bool isFirst = true;
+    OS << '<';
+    for (const auto *I : T->quals()) {
+      if (isFirst)
+        isFirst = false;
+      else
+        OS << ',';
+      OS << I->getName();
+    }
+    OS << '>';
+  }
+
+  spaceBeforePlaceHolder(OS);
+}
+
+void TypePrinter::printObjCTypeParamAfter(const ObjCTypeParamType *T,
+                                          raw_ostream &OS) { }
 
 void TypePrinter::printObjCObjectBefore(const ObjCObjectType *T,
                                         raw_ostream &OS) {
@@ -1445,50 +1466,46 @@ void TemplateSpecializationType::
                             const TemplateArgumentListInfo &Args,
                             const PrintingPolicy &Policy) {
   return PrintTemplateArgumentList(OS,
-                                   Args.getArgumentArray(),
-                                   Args.size(),
+                                   Args.arguments(),
                                    Policy);
 }
 
-void
-TemplateSpecializationType::PrintTemplateArgumentList(
-                                                raw_ostream &OS,
-                                                const TemplateArgument *Args,
-                                                unsigned NumArgs,
-                                                  const PrintingPolicy &Policy,
-                                                      bool SkipBrackets) {
+void TemplateSpecializationType::PrintTemplateArgumentList(
+    raw_ostream &OS, ArrayRef<TemplateArgument> Args,
+    const PrintingPolicy &Policy, bool SkipBrackets) {
   const char *Comma = Policy.MSVCFormatting ? "," : ", ";
   if (!SkipBrackets)
     OS << '<';
-  
+
   bool needSpace = false;
-  for (unsigned Arg = 0; Arg < NumArgs; ++Arg) {
+  bool FirstArg = true;
+  for (const TemplateArgument &Arg : Args) {
     // Print the argument into a string.
     SmallString<128> Buf;
     llvm::raw_svector_ostream ArgOS(Buf);
-    if (Args[Arg].getKind() == TemplateArgument::Pack) {
-      if (Args[Arg].pack_size() && Arg > 0)
+    if (Arg.getKind() == TemplateArgument::Pack) {
+      if (Arg.pack_size() && !FirstArg)
         OS << Comma;
       PrintTemplateArgumentList(ArgOS,
-                                Args[Arg].pack_begin(), 
-                                Args[Arg].pack_size(), 
+                                Arg.getPackAsArray(),
                                 Policy, true);
     } else {
-      if (Arg > 0)
+      if (!FirstArg)
         OS << Comma;
-      Args[Arg].print(Policy, ArgOS);
+      Arg.print(Policy, ArgOS);
     }
     StringRef ArgString = ArgOS.str();
 
     // If this is the first argument and its string representation
     // begins with the global scope specifier ('::foo'), add a space
     // to avoid printing the diagraph '<:'.
-    if (!Arg && !ArgString.empty() && ArgString[0] == ':')
+    if (FirstArg && !ArgString.empty() && ArgString[0] == ':')
       OS << ' ';
 
     OS << ArgString;
 
     needSpace = (!ArgString.empty() && ArgString.back() == '>');
+    FirstArg = false;
   }
 
   // If the last character of our string is '>', add another space to
@@ -1504,40 +1521,41 @@ TemplateSpecializationType::PrintTemplateArgumentList(
 // Sadly, repeat all that with TemplateArgLoc.
 void TemplateSpecializationType::
 PrintTemplateArgumentList(raw_ostream &OS,
-                          const TemplateArgumentLoc *Args, unsigned NumArgs,
+                          ArrayRef<TemplateArgumentLoc> Args,
                           const PrintingPolicy &Policy) {
   OS << '<';
   const char *Comma = Policy.MSVCFormatting ? "," : ", ";
 
   bool needSpace = false;
-  for (unsigned Arg = 0; Arg < NumArgs; ++Arg) {
-    if (Arg > 0)
+  bool FirstArg = true;
+  for (const TemplateArgumentLoc &Arg : Args) {
+    if (!FirstArg)
       OS << Comma;
-    
+
     // Print the argument into a string.
     SmallString<128> Buf;
     llvm::raw_svector_ostream ArgOS(Buf);
-    if (Args[Arg].getArgument().getKind() == TemplateArgument::Pack) {
+    if (Arg.getArgument().getKind() == TemplateArgument::Pack) {
       PrintTemplateArgumentList(ArgOS,
-                                Args[Arg].getArgument().pack_begin(), 
-                                Args[Arg].getArgument().pack_size(), 
+                                Arg.getArgument().getPackAsArray(),
                                 Policy, true);
     } else {
-      Args[Arg].getArgument().print(Policy, ArgOS);
+      Arg.getArgument().print(Policy, ArgOS);
     }
     StringRef ArgString = ArgOS.str();
-    
+
     // If this is the first argument and its string representation
     // begins with the global scope specifier ('::foo'), add a space
     // to avoid printing the diagraph '<:'.
-    if (!Arg && !ArgString.empty() && ArgString[0] == ':')
+    if (FirstArg && !ArgString.empty() && ArgString[0] == ':')
       OS << ' ';
 
     OS << ArgString;
 
     needSpace = (!ArgString.empty() && ArgString.back() == '>');
+    FirstArg = false;
   }
-  
+
   // If the last character of our string is '>', add another space to
   // keep the two '>''s separate tokens. We don't *have* to do this in
   // C++0x, but it's still good hygiene.
