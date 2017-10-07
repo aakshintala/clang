@@ -2385,8 +2385,8 @@ bool AMDGPUTargetInfo::initFeatureMap(
 
 static const unsigned TGSIAddrSpaceMap[] = {
     1, // opencl_global
-    3, // opencl_local
-    4, // opencl_constant
+    2, // opencl_local
+    3, // opencl_constant
     // FIXME: generic has to be added to the target
     0, // opencl_generic
     1, // cuda_device
